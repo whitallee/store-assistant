@@ -1,0 +1,6 @@
+*
+
+!*.js
+!*.json
+!*.cjs
+!.gitignore
