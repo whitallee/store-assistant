@@ -1,3 +1,4 @@
+require('dotenv').config();
 const puppeteerExtra = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const RecaptchaPlugin = require('puppeteer-extra-plugin-recaptcha');
@@ -9,6 +10,7 @@ puppeteerExtra.use(RecaptchaPlugin({
     id: '2captcha',
     token: process.env.CAPTCHA_TOKEN,
   },
+  visualFeedback: true,
 }));
 
 const app = express();
@@ -18,6 +20,37 @@ const LAUNCH_OPTS = {
   executablePath: '/usr/bin/chromium',
   args: ['--no-sandbox', '--disable-setuid-sandbox'],
 };
+
+async function solveCaptcha(page, log) {
+  log('solving captcha via 2captcha...');
+  const detected = await page.findRecaptchas();
+  log('findRecaptchas result:', JSON.stringify(detected, null, 2));
+  const { solved, error } = await page.solveRecaptchas();
+  if (error) throw new Error(`Captcha solve failed: ${error}`);
+  log(`captcha solved (${solved.length} token(s)) — waiting for redirect`);
+  await page.waitForNavigation({ waitUntil: 'load', timeout: 15000 });
+}
+
+function parseProductCards(html) {
+  // Runs inside page.evaluate — no closures over outer scope
+  const results = [];
+  const cards = document.querySelectorAll('[class*="ProductCard"], [class*="ProductTile"], [class*="product-card"]');
+  cards.forEach((card, i) => {
+    if (i >= 5) return;
+    const name = card.querySelector('[class*="ProductName"], [class*="productName"], h3, h2')?.textContent?.trim();
+    const price = card.querySelector('[class*="Price"], [class*="price"]')?.textContent?.trim();
+    const location = card.querySelector('[class*="ProductLocation"], [class*="storeMapText"], [class*="storeMap"]')?.textContent?.trim();
+    const addToCartBtn = card.querySelector('button');
+    const isOutOfStock = !!(
+      card.querySelector('[class*="OutOfStock"], [class*="outOfStock"], [class*="out-of-stock"]') ||
+      addToCartBtn?.disabled ||
+      addToCartBtn?.textContent?.toLowerCase().includes('out of stock') ||
+      addToCartBtn?.textContent?.toLowerCase().includes('unavailable')
+    );
+    if (name) results.push({ name, price, location: location ?? null, inStock: !isOutOfStock });
+  });
+  return results;
+}
 
 app.get('/', (req, res) => {
   res.send('Hello World! Server is running.');
@@ -51,15 +84,16 @@ app.get('/api/v1/product-location-lookup', async (req, res) => {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
     await page.goto('https://www.heb.com', { waitUntil: 'load', timeout: 30000 });
-    await page.screenshot({ path: '/tmp/heb-homepage.png' });
-    log('3) homepage loaded — url: %s | screenshot: /tmp/heb-homepage.png', page.url());
-    // Wait for the React app to fully render the header
+    // If captcha wall appears before the header renders, solve it then wait again
     try {
-      await page.waitForSelector('[data-testid="header_change_store"]', { timeout: 3000 });
-    } catch (TimeoutError) {
-      log('3b) header_change_store not found, probably captcha');
-      throw TimeoutError;
+      await page.waitForSelector('[data-testid="header_change_store"]', { timeout: 5000 });
+    } catch {
+      log('3) header not found — assuming captcha, solving...');
+      await solveCaptcha(page, log);
+      await page.waitForSelector('[data-testid="header_change_store"]', { timeout: 15000 });
     }
+    await page.screenshot({ path: '/tmp/heb-homepage.png' });
+    log('3) homepage ready — url: %s', page.url());
 
     // Step 1: Open the store picker
     await page.click('[data-testid="header_change_store"]');
@@ -97,42 +131,18 @@ app.get('/api/v1/product-location-lookup', async (req, res) => {
 
     // Step 6: Navigate directly to the search results URL
     const searchUrl = `https://www.heb.com/search?q=${encodeURIComponent(productName)}`;
-    await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-    log('10) search results page:', page.url());
-
+    await page.goto(searchUrl, { waitUntil: 'load', timeout: 30000 });
     await page.screenshot({ path: '/tmp/heb-search-results.png' });
-    log('10b) search results page screenshot — url: %s | screenshot: /tmp/heb-search-results.png', page.url());
+    log('10) search results loaded — url: %s', page.url());
 
-    // Step 6: Parse the first product result for aisle location and stock status
-    const products = await page.evaluate(() => {
-      const results = [];
-
-      // Each product card on the search results page
-      const cards = document.querySelectorAll('[class*="ProductCard"], [class*="ProductTile"], [class*="product-card"]');
-
-      cards.forEach((card, i) => {
-        if (i >= 5) return; // top 5 results
-
-        const name = card.querySelector('[class*="ProductName"], [class*="productName"], h3, h2')?.textContent?.trim();
-        const price = card.querySelector('[class*="Price"], [class*="price"]')?.textContent?.trim();
-
-        // Aisle location — same component used across the whole site
-        const location = card.querySelector('[class*="ProductLocation"], [class*="storeMapText"], [class*="storeMap"]')?.textContent?.trim();
-
-        // Out of stock — look for disabled add-to-cart or explicit OOS text
-        const addToCartBtn = card.querySelector('button');
-        const isOutOfStock = !!(
-          card.querySelector('[class*="OutOfStock"], [class*="outOfStock"], [class*="out-of-stock"]') ||
-          addToCartBtn?.disabled ||
-          addToCartBtn?.textContent?.toLowerCase().includes('out of stock') ||
-          addToCartBtn?.textContent?.toLowerCase().includes('unavailable')
-        );
-
-        if (name) results.push({ name, price, location: location ?? null, inStock: !isOutOfStock });
-      });
-
-      return results;
-    });
+    // Parse product cards; if empty assume captcha wall, solve and re-parse
+    let products = await page.evaluate(parseProductCards);
+    if (products.length === 0) {
+      log('10b) no products found — assuming captcha, solving...');
+      await solveCaptcha(page, log);
+      await page.screenshot({ path: '/tmp/heb-search-results.png' });
+      products = await page.evaluate(parseProductCards);
+    }
 
     log('11) parsed product cards:', products.length);
 
@@ -170,6 +180,24 @@ app.get('/api/v1/product-location-lookup', async (req, res) => {
   } finally {
     await browser.close();
     log('browser closed');
+  }
+});
+
+// TEMP: debug endpoint — remove when done
+app.get('/debug/find-captchas', async (req, res) => {
+  const browser = await puppeteerExtra.launch(LAUNCH_OPTS);
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.goto('https://www.heb.com', { waitUntil: 'load', timeout: 30000 });
+    const searchUrl = `https://www.heb.com/search?q=${encodeURIComponent(req.query.q || 'whole milk')}`;
+    await page.goto(searchUrl, { waitUntil: 'load', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 3000));
+    await page.screenshot({ path: '/tmp/debug-captcha.png' });
+    const detected = await page.findRecaptchas();
+    res.json(detected);
+  } finally {
+    await browser.close();
   }
 });
 
