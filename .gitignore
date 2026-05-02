@@ -4,3 +4,4 @@
 !*.json
 !*.cjs
 !.gitignore
+!README.md
